@@ -1,0 +1,13 @@
+# open-mcp-ksuite — one process, one public host. Nothing here is secret.
+# kSuite has no server step: people paste an Infomaniak API token.
+public_url = "https://ksuite.example.org"
+app = "ksuite"
+state_dir = "/var/lib/open-mcp-ksuite"
+source_url = "https://github.com/etlyon/open-mcp-ksuite"
+maker_label = "open source"
+other_assistants = true
+denied_hosts = []
+# Who may connect (mailbox domain). Empty = anyone.
+# allowed_mail_domains = ["example.com"]
+# Who mail/invites may go to. Empty = drafts only, nobody invited.
+# send_recipient_domains = ["example.com"]
