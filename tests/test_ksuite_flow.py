@@ -75,7 +75,7 @@ class KsuiteFlow(unittest.TestCase):
         verifier, challenge = pkce()
         r = self.client.get("/authorize", params={"response_type": "code", "client_id": client_id, "redirect_uri": redirect,
                                                   "code_challenge": challenge, "code_challenge_method": "S256",
-                                                  "state": "st-1", "resource": resource})
+                                                  "state": "st-1", "resource": resource, "scope": "read write send"})
         return verifier, r
 
     def token_step(self, client_id, redirect=CLAUDE_CB):
@@ -138,12 +138,22 @@ class KsuiteFlow(unittest.TestCase):
         self.assertIn(f'href="{path}"', bad.text)                          # Try again = the token step
         self.assertEqual((self.held_secret(path), self.connections()), (0, 0))
         self.assertIn("API token", plain(self.client.get(path).text))
-        # 2. A token without Calendar: the missing part, and how to fix it.
-        missing = self.client.post(path + "/key", data={"csrf": csrf, "key": ALICE_NO_CALENDAR})
-        self.assertEqual(missing.status_code, 400)
-        self.assertIn("This token cannot open Calendar. Make a new token with workspace:calendar and paste it again.",
-                      plain(missing.text))
-        self.assertEqual((self.held_secret(path), self.connections()), (0, 0))
+        # 2. A token without Calendar still connects Mail and the profile. Calendar tools stay hidden.
+        #    Its own sign-in, so the journey below still has an open token step.
+        partial_id = self.register()
+        partial_verifier, partial_path, partial_page = self.token_step(partial_id)
+        missing = self.client.post(partial_path + "/key", data={"csrf": csrf_of(partial_page), "key": ALICE_NO_CALENDAR})
+        self.assertEqual(missing.status_code, 200, missing.text)
+        self.assertIn("kSuite is connected to Claude.", plain(missing.text))
+        partial_tok = self.tokens(partial_id, missing.text, partial_verifier)
+        partial_grant = self.application.store.check_access(partial_tok["access_token"])
+        partial = self.application.store.get_connection(partial_grant)
+        self.assertEqual(partial.secret["opened"], ["profile", "mail"])
+        self.mcp(partial_tok["access_token"], "initialize", {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})
+        partial_names = {t["name"] for t in self.mcp(partial_tok["access_token"], "tools/list", rid=2).json()["result"]["tools"]}
+        self.assertIn("ksuite_mail_list", partial_names)
+        self.assertNotIn("ksuite_calendar_list_events", partial_names)
         # 3. The right token: connected.
         before = len(FAKE.requests)
         done = self.client.post(path + "/key", data={"csrf": csrf, "key": "  " + ALICE + "\n"})
@@ -190,15 +200,24 @@ class KsuiteFlow(unittest.TestCase):
         self.assertEqual(FAKE.other_hosts(), set())
 
     def test_every_part_missing_is_named(self):
-        _, path, page = self.token_step(self.register())
+        """Mail alone still connects. Profile and Calendar stay closed, so their tools are hidden."""
+        client_id = self.register()
+        verifier, path, page = self.token_step(client_id)
         r = self.client.post(path + "/key", data={"csrf": csrf_of(page), "key": ALICE_MAIL_ONLY})
-        self.assertIn("This token cannot open your profile and Calendar. Make a new token with user_info and "
-                      "workspace:calendar and paste it again.", plain(r.text))
-        fr = self.client.get(path + "?lang=fr")
-        self.assertEqual(fr.status_code, 200)
-        r = self.client.post(path + "/key", data={"csrf": csrf_of(page), "key": ALICE_MAIL_ONLY})
-        self.assertIn("Ce token ne peut pas ouvrir votre profil et Calendrier. Créez un nouveau token avec user_info et "
-                      "workspace:calendar et collez-le à nouveau.", plain(r.text))
+        self.assertEqual(r.status_code, 200, r.text)
+        tok = self.tokens(client_id, r.text, verifier)
+        grant = self.application.store.check_access(tok["access_token"])
+        conn = self.application.store.get_connection(grant)
+        self.assertEqual(conn.secret["opened"], ["mail"])
+        self.assertEqual(conn.remote_user, "0")
+        self.assertTrue(conn.display["label"])
+        self.assertEqual(conn.display["email"], "alice@example.org")
+        self.mcp(tok["access_token"], "initialize", {
+            "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}})
+        names = {t["name"] for t in self.mcp(tok["access_token"], "tools/list", rid=2).json()["result"]["tools"]}
+        self.assertIn("ksuite_mail_list", names)
+        self.assertNotIn("ksuite_calendar_list_events", names)
+        self.assertIn("ksuite_connection_status", names)
 
     def test_a_badly_pasted_token_asks_nothing(self):
         _, path, page = self.token_step(self.register())
@@ -210,8 +229,7 @@ class KsuiteFlow(unittest.TestCase):
 
     def test_infomaniak_trouble_words(self):
         for mode, words in (("rate_limited", "Infomaniak received too many requests. Wait a minute and try again."),
-                            ("server_error", "Infomaniak answered with an error. Try again in a minute."),
-                            ("hidden_refusal", "This token cannot open your profile.")):
+                            ("server_error", "Infomaniak answered with an error. Try again in a minute.")):
             with self.subTest(mode=mode):
                 FAKE.reset()
                 FAKE.mode.add(mode)
@@ -220,6 +238,19 @@ class KsuiteFlow(unittest.TestCase):
                 self.assertEqual(r.status_code, 400)
                 self.assertIn(words, plain(r.text))
                 self.assertEqual(self.connections(), 0)
+        # A profile refusal hidden in HTTP 200 still connects Mail and Calendar. The profile stays closed.
+        FAKE.reset()
+        FAKE.mode.add("hidden_refusal")
+        client_id = self.register()
+        verifier, path, page = self.token_step(client_id)
+        r = self.client.post(path + "/key", data={"csrf": csrf_of(page), "key": ALICE})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.connections(), 1)
+        tok = self.tokens(client_id, r.text, verifier)
+        grant = self.application.store.check_access(tok["access_token"])
+        conn = self.application.store.get_connection(grant)
+        self.assertEqual(conn.remote_user, "0")
+        self.assertEqual(conn.secret["opened"], ["mail", "calendar"])
 
     # ------------------------------------------------------------------ no address step, nothing to change
     def test_no_per_server_address(self):

@@ -38,7 +38,7 @@ def connection(conn_id: str = "c-ksuite-alice", secret: dict | None = None, user
                name: str = "Alice Example") -> Connection:
     return Connection(conn_id=conn_id, app="ksuite", server="https://api.infomaniak.com", remote_user=user,
                       client_id="t", resource="r", display={"name": name, "email": "", "label": name},
-                      secret=dict(secret or ALICE_SECRET))
+                      secret=dict(secret or ALICE_SECRET), scope="read write send")
 
 
 def docx_bytes(text: str) -> bytes:
@@ -88,8 +88,12 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
         CURRENT.reset(self.token)
         self.token = CURRENT.set(conn)
 
-    async def call(self, name: str, arguments: dict | None = None, **kw) -> dict | str:
-        async with Client(tools.mcp) as client:
+    async def call(self, name: str, arguments: dict | None = None, *, confirm: bool = False, **kw) -> dict | str:
+        async def accept(message, response_type, params, ctx):
+            return {"confirm": True}
+
+        handler = accept if confirm else None
+        async with Client(tools.mcp, elicitation_handler=handler) as client:
             result = await client.call_tool(name, arguments or {}, raise_on_error=False, **kw)
         text = result.content[0].text
         try:
@@ -98,10 +102,22 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
             return text
 
     async def confirmed(self, name: str, arguments: dict) -> dict | str:
-        """An ask tool: the first call runs nothing and hands a token; the same call with it runs."""
-        asked = await self.call(name, arguments)
-        self.assertEqual(asked["status"], "confirmation_required", asked)
-        return await self.call(name, {**arguments, "confirm_token": asked["confirm_token"]})
+        """An ask tool runs only after the person's confirmation form, never a token the model can copy."""
+        return await self.call(name, arguments, confirm=True)
+
+    async def question(self, name: str, arguments: dict) -> str:
+        """The words shown to the person. Declining runs nothing."""
+        seen: list[str] = []
+
+        async def decline(message, response_type, params, ctx):
+            seen.append(str(message))
+            return {"confirm": False}
+
+        async with Client(tools.mcp, elicitation_handler=decline) as client:
+            result = await client.call_tool(name, arguments, raise_on_error=False)
+        self.assertEqual(len(seen), 1, getattr(result, "content", result))
+        self.assertIn("nothing ran", result.content[0].text)
+        return seen[0]
 
     def message(self, **extra) -> dict:
         return {"params": {"to": ["Carol Example <carol@example.com>"], "subject": "Plan", "body": "Line 1\nLine <2>",
@@ -187,29 +203,30 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({r.url.host for r in FAKE.requests}, {"mail.infomaniak.com"})
         self.assertFalse(any(TEAM_BOX in str(r.url) for r in FAKE.requests))  # never the mailbox listed first
 
-    async def test_send_asks_and_binds_the_content(self):
+    async def test_send_asks_and_the_model_cannot_confirm(self):
         asked = await self.call("ksuite_mail_send", self.message())
-        self.assertEqual((asked["status"], asked["executed"]), ("confirmation_required", False))
+        blob = json.dumps(asked) if isinstance(asked, dict) else str(asked)
+        self.assertNotIn("confirm_token", blob)
+        self.assertIn("nothing ran", blob)
         self.assertEqual((FAKE.requests, FAKE.sent), ([], []))                 # nothing ran
+        forged = await self.call("ksuite_mail_send", {**self.message(), "confirm_token": "1." + "ab" * 32})
+        self.assertIn("confirm_token", str(forged))
+        self.assertEqual(FAKE.sent, [])                                       # a token the model can copy never sends
         changed = await self.call("ksuite_mail_send", {"params": {**self.message()["params"], "to": ["eve@example.net"]},
-                                                       "confirm_token": asked["confirm_token"]})
-        self.assertIn("not issued for this account, tool and arguments", str(changed))
-        self.assertEqual(FAKE.sent, [])                                       # a confirmation is for exactly that message
-        sent = await self.call("ksuite_mail_send", {**self.message(), "confirm_token": asked["confirm_token"]})
+                                                       "confirm_token": "9." + "cd" * 32})
+        self.assertEqual(FAKE.sent, [])
+        sent = await self.confirmed("ksuite_mail_send", self.message())
         self.assertTrue(sent["sent"], sent)
         self.assertEqual(len(FAKE.sent), 1)
         self.assertEqual(FAKE.sent[0]["from"]["email"], "alice@example.org")
         self.assertEqual(FAKE.sent[0]["mailbox"], ALICE_BOX)
         self.assertEqual(FAKE.sent[0]["to"], [{"name": "Carol Example", "email": "carol@example.com"}])
-        again = await self.call("ksuite_mail_send", {**self.message(), "confirm_token": asked["confirm_token"]})
-        self.assertIn("already used", str(again))
+        again = await self.call("ksuite_mail_send", {**self.message(), "confirm_token": "1." + "ab" * 32})
         self.assertEqual(len(FAKE.sent), 1)
 
     async def refused_before_any_request(self, tool: str, arguments: dict) -> None:
         """Invalid arguments never run. An ask tool asks first (nothing runs), then refuses them once confirmed."""
-        result = await self.call(tool, arguments)
-        if isinstance(result, dict) and result.get("status") == "confirmation_required":
-            result = await self.call(tool, {**arguments, "confirm_token": result["confirm_token"]})
+        result = await self.call(tool, arguments, confirm=True)
         self.assertIn("validation error", str(result).lower())
         self.assertEqual(FAKE.requests, [])
 
@@ -299,8 +316,9 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(FAKE.messages[ALICE_BOX]["inbox-1"]["101"]["seen"])
         await tools.ksuite_mail_mark(tools.MarkInput(folder_id="inbox-1", message_ids=["101"], action="star"))
         self.assertTrue(FAKE.messages[ALICE_BOX]["inbox-1"]["101"]["flagged"])
-        asked = await self.call("ksuite_mail_move", {"params": {"folder_id": "inbox-1", "message_ids": ["102"], "to": "trash"}})
-        self.assertEqual(asked["status"], "confirmation_required")             # moving asks first
+        asked = await self.question("ksuite_mail_move", {"params": {"folder_id": "inbox-1", "message_ids": ["102"], "to": "trash"}})
+        self.assertIn("ksuite_mail_move", asked)                                # moving asks first
+        self.assertNotIn("102", FAKE.messages[ALICE_BOX].get("trash-1", {}))
         moved = await self.confirmed("ksuite_mail_move", {"params": {"folder_id": "inbox-1", "message_ids": ["102"], "to": "trash"}})
         self.assertEqual(moved["to_folder_id"], "trash-1")
         self.assertIn("102", FAKE.messages[ALICE_BOX]["trash-1"])
@@ -347,8 +365,8 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
 
     async def test_invite_and_delete_ask_first(self):
         invite = {"params": {"event_id": "501", "attendees": ["carol@example.com"]}}
-        asked = await self.call("ksuite_calendar_invite", invite)
-        self.assertEqual(asked["status"], "confirmation_required")
+        asked = await self.question("ksuite_calendar_invite", invite)
+        self.assertIn("Invite people to", asked)
         self.assertEqual(FAKE.notified, [])
         done = await self.confirmed("ksuite_calendar_invite", invite)
         self.assertEqual(done["invited"], ["carol@example.com"])
@@ -360,8 +378,8 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
 
     def test_policy(self):
         """Reads and undoable writes run; send, invite and delete always ask, even when an operator allows them."""
-        from open_connectors.policy import Policy
-        policy = tools.mcp.middleware[0]
+        from open_connectors.policy import AccountToolPolicy, Policy
+        policy = next(item for item in tools.mcp.middleware if isinstance(item, AccountToolPolicy))
         allow_all = Policy(allow=frozenset(tools.MANDATORY_ASK_TOOLS | {"ksuite_mail_move"}))
         expected = {"ksuite_mail_send": "ask", "ksuite_calendar_invite": "ask", "ksuite_calendar_delete_event": "ask",
                     "ksuite_mail_move": "allowed"}
@@ -654,21 +672,22 @@ class KsuiteTools(unittest.IsolatedAsyncioTestCase):
         """The confirmation names the sender, every recipient, subject, attachments and the start of the text."""
         message = self.message(cc=["dan@example.com"], bcc=["Boss <boss@example.com>"],
                                attachments=[{"name": "q3.pdf", "content_base64": b64(b"x" * 2048)}])
-        asked = await self.call("ksuite_mail_send", message)
-        self.assertEqual(asked["status"], "confirmation_required")
-        self.assertEqual(asked["summary"], "\n".join([
+        asked = await self.question("ksuite_mail_send", message)
+        self.assertEqual(asked.split("\n\n")[0], "\n".join([
             "Send this e-mail from alice@example.org?", "To: carol@example.com", "Cc: dan@example.com",
             "Bcc: boss@example.com", "Subject: Plan", "Attachments: q3.pdf (2 KB)", "Text: Line 1 Line <2>"]))
+        self.assertEqual(FAKE.sent, [])
         FAKE.events[501].update(description="Budget figures", attendees=[{"address": "bob@example.com", "organizer": False}])
-        invite = await self.call("ksuite_calendar_invite", {"params": {"event_id": "501",
-                                                                        "attendees": ["bob@example.com", "carol@example.com"]}})
+        invite = await self.question("ksuite_calendar_invite", {"params": {"event_id": "501",
+                                                                            "attendees": ["bob@example.com", "carol@example.com"]}})
         self.assertIn('Invite people to \u201cPlanning\u201d (2026-11-12 09:00:00 to 2026-11-12 10:00:00, Europe/Zurich)?',
-                      invite["summary"])
-        self.assertIn("e-mail an invitation to: bob@example.com, carol@example.com", invite["summary"])
-        self.assertIn("Description sent with it: Budget figures", invite["summary"])
-        delete = await self.call("ksuite_calendar_delete_event", {"params": {"event_id": "501"}})
-        self.assertIn("Delete \u201cPlanning\u201d", delete["summary"])
-        self.assertIn("Nobody is e-mailed.", delete["summary"])
+                      invite)
+        self.assertIn("e-mail an invitation to: bob@example.com, carol@example.com", invite)
+        self.assertIn("Description sent with it: Budget figures", invite)
+        delete = await self.question("ksuite_calendar_delete_event", {"params": {"event_id": "501"}})
+        self.assertIn("Delete \u201cPlanning\u201d", delete)
+        self.assertIn("Nobody is e-mailed.", delete)
+        self.assertEqual(FAKE.deleted_events, [])
         # A client that can ask its person sees the same words in the question itself.
         seen = []
 

@@ -45,6 +45,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.tools import ToolResult
 from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -80,6 +82,47 @@ WRITE_ACTION = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempo
 SET_ACTION = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True)
 DESTRUCTIVE_ACTION = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
 
+def _opened_parts(secret: object) -> set[str] | None:
+    """Parts this token opened. None means an older connection, which required every part."""
+    if not isinstance(secret, dict):
+        return None
+    raw = secret.get("opened")
+    if not isinstance(raw, list):
+        return None
+    return {part for part in raw if part in {"profile", "mail", "calendar"}}
+
+
+def _part_open(name: str, opened: set[str] | None) -> bool:
+    if opened is None:
+        return True
+    if name.startswith("ksuite_mail_"):
+        return "mail" in opened
+    if name.startswith("ksuite_calendar_"):
+        return "calendar" in opened
+    return True
+
+
+class OpenedParts(Middleware):
+    """Hide and refuse tools for parts this token did not open."""
+
+    async def on_list_tools(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
+        tools = await call_next(context)
+        try:
+            opened = _opened_parts(identity.current_connection().secret)
+        except identity.IdentityRefused:
+            return []
+        return [tool for tool in tools if _part_open(tool.name, opened)]
+
+    async def on_call_tool(self, context: MiddlewareContext[Any], call_next: Any) -> Any:
+        try:
+            opened = _opened_parts(identity.current_connection().secret)
+        except identity.IdentityRefused as exc:
+            raise ToolError(str(exc)) from None
+        if not _part_open(context.message.name, opened):
+            raise ToolError("This token did not open that part of kSuite; nothing ran.")
+        return await call_next(context)
+
+
 mcp = FastMCP(
     name="kSuite",
     instructions=(
@@ -91,8 +134,11 @@ mcp = FastMCP(
         "ksuite_connection_status names the account. If Infomaniak refuses the token, tell the person to connect "
         "kSuite again in their assistant."
     ),
-    middleware=[AccountToolPolicy(app=APP, connect_tool=CONNECT_TOOL, mandatory_ask_tools=MANDATORY_ASK_TOOLS,
-                                  summary=lambda tool, arguments: confirmation_summary(tool, arguments))],
+    middleware=[
+        OpenedParts(),
+        AccountToolPolicy(app=APP, connect_tool=CONNECT_TOOL, mandatory_ask_tools=MANDATORY_ASK_TOOLS,
+                          summary=lambda tool, arguments: confirmation_summary(tool, arguments)),
+    ],
 )
 
 KEYED_TOOL_TIMEOUTS: dict[str, float] = {

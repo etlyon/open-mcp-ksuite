@@ -73,7 +73,8 @@ class KsuiteIdentity:
     user_id: str
     name: str
     email: str
-    mailbox: Mailbox
+    mailbox: Mailbox | None
+    opened: tuple[str, ...] = ("profile", "mail", "calendar")
 
 
 def mail_domain(address: object) -> str | None:
@@ -168,26 +169,42 @@ async def identify(server_url: str, key: str, _extra: str = "", *,
             refused.append(part)
         else:
             found[part] = data
-    if len(refused) == len(PARTS):
+    if not found:
         raise KsuiteCheckError("token_refused")
-    if refused:
-        raise KsuiteCheckError("missing_scope", ",".join(refused))
-    profile = found["profile"]
-    user_id = profile.get("id") if isinstance(profile, dict) else None
-    if isinstance(user_id, bool) or not isinstance(user_id, (int, str)) or not str(user_id).isdigit():
-        raise KsuiteCheckError("ksuite_error")
-    email = _text(profile.get("email"), 254)
-    name = _text(profile.get("display_name")) or " ".join(
-        x for x in (_text(profile.get("first_name")), _text(profile.get("last_name"))) if x)
-    mailbox = pick_mailbox(found["mail"], email)
-    if not domain_allowed(mailbox.email):
+    opened = tuple(part for part, _, _ in PARTS if part in found)
+    profile = found.get("profile")
+    profile = profile if isinstance(profile, dict) else {}
+    if "profile" in found:
+        user_id = profile.get("id")
+        if isinstance(user_id, bool) or not isinstance(user_id, (int, str)) or not str(user_id).isdigit():
+            raise KsuiteCheckError("ksuite_error")
+        user_id = str(user_id)
+        email = _text(profile.get("email"), 254)
+        name = _text(profile.get("display_name")) or " ".join(
+            x for x in (_text(profile.get("first_name")), _text(profile.get("last_name"))) if x)
+    else:
+        user_id = "0"
+        email = ""
+        name = ""
+    mailbox = pick_mailbox(found["mail"], email) if "mail" in found else None
+    if mailbox is not None and not domain_allowed(mailbox.email):
         raise KsuiteCheckError("account_not_listed")
-    return KsuiteIdentity(user_id=str(user_id), name=name, email=email if mail_domain(email) else "", mailbox=mailbox)
+    if mailbox is None and email and not domain_allowed(email):
+        raise KsuiteCheckError("account_not_listed")
+    if mailbox is not None:
+        email = email or mailbox.email
+        name = name or mailbox.name or mailbox.email
+    return KsuiteIdentity(user_id=user_id, name=name, email=email if mail_domain(email) else "",
+                          mailbox=mailbox, opened=opened)
 
 
 def connection_allowed(connection: Any) -> bool:
     """False when this connection's mailbox domain is no longer on the operator's list (checked on every call)."""
-    return domain_allowed((connection.secret or {}).get("mailbox_email"))
+    secret = connection.secret or {}
+    email = secret.get("mailbox_email") or secret.get("email")
+    if not ALLOWED_MAIL_DOMAINS:
+        return True
+    return domain_allowed(email)
 
 
 def open_url(_server_url: str) -> str:
@@ -196,9 +213,14 @@ def open_url(_server_url: str) -> str:
 
 
 def secret(key: str, identity: KsuiteIdentity) -> dict[str, Any]:
+    payload: dict[str, Any] = {"api_token": api.clean_token(key) or "", "opened": list(identity.opened)}
     box = identity.mailbox
-    return {"api_token": api.clean_token(key) or "", "mailbox_uuid": box.uuid, "mailbox_email": box.email,
-            "mailbox_name": box.name, "hosting_id": box.hosting_id}
+    if box is not None:
+        payload.update(mailbox_uuid=box.uuid, mailbox_email=box.email, mailbox_name=box.name,
+                       hosting_id=box.hosting_id)
+    if identity.email:
+        payload["email"] = identity.email
+    return payload
 
 
 def display(identity: KsuiteIdentity) -> dict[str, Any]:
