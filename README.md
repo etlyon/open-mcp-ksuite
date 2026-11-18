@@ -10,24 +10,21 @@ Works with Claude, ChatGPT, Le Chat, eBot and any assistant that can add a conne
 
 ## Install in 5 minutes
 
-**1. Run one Docker container** (TLS in front of it; set the three names below — never put secrets in the image):
+**1. Set the names once.** Copy `config.example.toml` to the untracked file
+`connector.toml`, replace the example `public_url`, and set the optional mailbox
+and recipient-domain policies. Keep `state_dir = "/data"`. This file contains
+configuration names, not an Infomaniak token.
+
+**2. Start it with one command:**
 
 ```sh
-mkdir -p /etc/open-mcp-ksuite /var/lib/open-mcp-ksuite
-cat >/etc/open-mcp-ksuite/connector.toml <<'EOF'
-public_url = "https://ksuite.example.org"
-app = "ksuite"
-state_dir = "/var/lib/open-mcp-ksuite"
-source_url = "https://github.com/etlyon/open-mcp-ksuite"
-maker_label = "open source"
-EOF
-docker build -t open-mcp-ksuite:0.1.0 .
-docker run --name open-mcp-ksuite --restart=unless-stopped \
-  -p 127.0.0.1:8130:8000 \
-  -v /etc/open-mcp-ksuite/connector.toml:/config/connector.toml:ro \
-  -v /var/lib/open-mcp-ksuite:/var/lib/open-mcp-ksuite \
-  open-mcp-ksuite:0.1.0
+docker compose up -d --build
 ```
+
+The supplied Compose file builds the reviewed source, binds the service only to
+`127.0.0.1:8130`, keeps state in a named volume, mounts the configuration
+read-only, drops Linux capabilities and runs with a read-only container
+filesystem. Put a reverse proxy with TLS in front of it.
 
 Settings (names only — put your own values):
 | Setting | Meaning |
@@ -37,15 +34,19 @@ Settings (names only — put your own values):
 | `state_dir` | Where the SQLite file lives (0700) |
 | `allowed_mail_domains` / `send_recipient_domains` | Who may connect / who mail may go to — see `config.example.toml`. `allowed_servers` does not apply (no server to pick). |
 
-Put a reverse proxy with TLS in front (`X-Forwarded-For` / `X-Forwarded-Proto`) and pass `--forwarded-allow-ips` if you change the entrypoint.
+If the reverse proxy supplies `X-Forwarded-For` / `X-Forwarded-Proto`, pass
+`--forwarded-allow-ips` only for the exact trusted proxy if you change the
+entrypoint.
 
-**2. Connect it in eBot (or any AI app)**
+**3. Connect it in eBot (or any AI app)**
 
 1. In the assistant, add a custom connector / MCP server and paste `https://<your-connector-host>/mcp`.
 2. Complete the on-screen window (address + key, or Grant access, or Infomaniak token — this app's steps are below).
 3. Allow the assistant when asked. Done.
 
 Same paste works in Claude, ChatGPT, Le Chat and eBot. Menu names per assistant: [docs/assistants.md](docs/assistants.md).
+
+Security review scope and results: [SECURITY_REVIEW.md](SECURITY_REVIEW.md).
 
 ## kSuite (Infomaniak)
 
